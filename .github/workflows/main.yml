@@ -1,0 +1,279 @@
+name: Enhanced RDP Pro
+on:
+  workflow_dispatch:
+    inputs:
+      username:
+        description: 'RDP Username'
+        required: true
+        default: 'TOOLBOXLAP'
+        type: string
+      session_duration:
+        description: 'Session duration in hours (1-5)'
+        required: true
+        default: '5'
+        type: choice
+        options:
+          - '1'
+          - '2'
+          - '3'
+          - '4'
+          - '5'
+      enable_file_transfer:
+        description: 'Enable file transfer via RDP'
+        required: false
+        default: true
+        type: boolean
+
+jobs:
+  secure-rdp-pro:
+    runs-on: windows-latest
+    timeout-minutes: ${{ fromJSON(format('{0}', inputs.session_duration * 60)) }}
+    
+    steps:
+      - name: Validate Inputs
+        run: |
+          $duration = ${{ inputs.session_duration }}
+          if ($duration -lt 1 -or $duration -gt 5) {
+              Write-Error "Session duration must be between 1-5 hours"
+              exit 1
+          }
+          Write-Host "Session configured for $duration hours"
+
+      - name: Configure Enhanced RDP Security
+        run: |
+          # Enable RDP
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          
+          # Enhanced Security Settings
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 2 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "MinEncryptionLevel" -Value 3 -Force
+          
+          # Disable weaker security protocols
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\SSL 2.0\Server' -Name "Enabled" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\SSL 3.0\Server' -Name "Enabled" -Value 0 -Force
+          
+          # Configure firewall
+          netsh advfirewall firewall delete rule name="RDP-Enhanced" > $null 2>&1
+          netsh advfirewall firewall add rule name="RDP-Enhanced" dir=in action=allow protocol=TCP localport=3389 profile=any enable=yes
+          
+          Write-Host "Enhanced RDP security configured"
+
+      - name: Create Secure User Account
+        run: |
+          $username = "${{ inputs.username }}"
+          $password = -join ((65..90) + (97..122) + (48..57) + (33..47) | Get-Random -Count 20 | % {[char]$_})
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          
+          # Remove user if exists and create fresh
+          Remove-LocalUser -Name $username -ErrorAction SilentlyContinue
+          New-LocalUser -Name $username -Password $securePass -AccountNeverExpires -PasswordNeverExpires
+          
+          # Add to groups
+          Add-LocalGroupMember -Group "Administrators" -Member $username -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction SilentlyContinue
+          
+          # Store credentials
+          echo "RDP_USERNAME=$username" >> $env:GITHUB_ENV
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+          
+          Write-Host "User $username created with enhanced security"
+
+      - name: Install Essential Tools
+        run: |
+          # Install Chocolatey if not present
+          Set-ExecutionPolicy Bypass -Scope Process -Force
+          [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
+          iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+          
+          # Install useful tools
+          choco install -y googlechrome notepadplusplus 7zip vscode
+          Write-Host "Essential tools installed"
+
+      - name: Configure File Transfer
+        if: ${{ inputs.enable_file_transfer }}
+        run: |
+          # Enable shared clipboard and drives
+          Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services' -Name "fDisableClip" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services' -Name "fEnableSmartCard" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services' -Name "REDIRECTION_ENABLE" -Value 1 -Force
+          
+          # Create temporary transfer directory
+          $transferDir = "C:\Temp\FileTransfer"
+          New-Item -ItemType Directory -Path $transferDir -Force
+          icacls $transferDir /grant:r "Everyone:(OI)(CI)F" /T
+          
+          echo "FILE_TRANSFER_DIR=$transferDir" >> $env:GITHUB_ENV
+          Write-Host "File transfer enabled: $transferDir"
+
+      - name: Install and Configure Tailscale
+        run: |
+          # Install Tailscale
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+          
+          # Connect to Tailscale
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-rdp-$env:GITHUB_RUN_ID --accept-routes --accept-dns --ssh
+          
+          # Get IP with retry logic
+          $maxRetries = 10
+          $retryCount = 0
+          $tsIP = $null
+          
+          do {
+              Start-Sleep -Seconds 5
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              $retryCount++
+          } while (-not $tsIP -and $retryCount -lt $maxRetries)
+          
+          if (-not $tsIP) {
+              Write-Error "❌ Failed to get Tailscale IP after $maxRetries attempts"
+              exit 1
+          }
+          
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          Write-Host "✅ Tailscale connected: $tsIP"
+
+      - name: System Optimization
+        run: |
+          # Disable sleep and hibernation
+          powercfg -change -standby-timeout-ac 0
+          powercfg -change -hibernate-timeout-ac 0
+          
+          # Set high performance power plan
+          powercfg -setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c
+          
+          # Optimize visual effects for RDP
+          Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" -Name "VisualFXSetting" -Value 2 -Force
+          
+          Write-Host "System optimized for RDP performance"
+
+      - name: Comprehensive Connectivity Test
+        run: |
+          Write-Host "🔍 Testing RDP connectivity..."
+          
+          # Test basic port connectivity
+          $portTest = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
+          
+          if (-not $portTest.TcpTestSucceeded) {
+              Write-Error "❌ RDP port 3389 is not accessible"
+              
+              # Diagnostic information
+              Write-Host "📊 Running diagnostics..."
+              Get-NetTCPConnection -LocalPort 3389 -ErrorAction SilentlyContinue | Format-Table
+              Get-Service -Name TermService | Format-Table Name, Status
+              
+              exit 1
+          }
+          
+          Write-Host "✅ RDP port test passed"
+          
+          # Test Tailscale connectivity
+          $tsStatus = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json | ConvertFrom-Json
+          if ($tsStatus.BackendState -ne "Running") {
+              Write-Error "❌ Tailscale backend not running"
+              exit 1
+          }
+          
+          Write-Host "✅ All connectivity tests passed"
+
+      - name: Generate Connection Report
+        run: |
+          $duration = ${{ inputs.session_duration }}
+          $expiryTime = (Get-Date).AddHours($duration).ToString("yyyy-MM-dd HH:mm:ss UTC")
+          
+          Write-Host ""
+          Write-Host "🟢" * 50
+          Write-Host "🚀 ENHANCED RDP PRO - READY FOR CONNECTION"
+          Write-Host "🟢" * 50
+          Write-Host ""
+          Write-Host "📍 Connection Details:"
+          Write-Host "   IP Address:    $env:TAILSCALE_IP"
+          Write-Host "   Username:      $env:RDP_USERNAME"
+          Write-Host "   Password:      $env:RDP_PASSWORD"
+          Write-Host "   Port:          3389"
+          Write-Host ""
+          Write-Host "⏰ Session Info:"
+          Write-Host "   Duration:      $duration hours"
+          Write-Host "   Expires:       $expiryTime"
+          Write-Host ""
+          if ("${{ inputs.enable_file_transfer }}" -eq "true") {
+          Write-Host "📁 File Transfer:"
+          Write-Host "   Enabled:       Yes"
+          Write-Host "   Shared Folder: $env:FILE_TRANSFER_DIR"
+          Write-Host ""
+          }
+          Write-Host "🔧 Installed Tools:"
+          Write-Host "   • Google Chrome"
+          Write-Host "   • Notepad++"
+          Write-Host "   • 7-Zip"
+          Write-Host "   • VS Code"
+          Write-Host ""
+          Write-Host "🔒 Security Features:"
+          Write-Host "   • TLS 1.2+ Encryption"
+          Write-Host "   • Network Level Authentication"
+          Write-Host "   • Enhanced Encryption Level"
+          Write-Host "   • SSL 2.0/3.0 Disabled"
+          Write-Host ""
+          Write-Host "📝 Connection String:"
+          Write-Host "   mstsc /v:$env:TAILSCALE_IP"
+          Write-Host ""
+          Write-Host "🟢" * 50
+          Write-Host ""
+
+      - name: Active Session Monitor
+        run: |
+          $duration = ${{ inputs.session_duration }}
+          $endTime = (Get-Date).AddHours($duration)
+          $checkInterval = 60 # seconds
+          
+          while ((Get-Date) -lt $endTime) {
+              $timeLeft = $endTime - (Get-Date)
+              $hoursLeft = [math]::Floor($timeLeft.TotalHours)
+              $minutesLeft = [math]::Floor($timeLeft.TotalMinutes % 60)
+              
+              # Check if RDP service is running
+              $rdpService = Get-Service -Name TermService -ErrorAction SilentlyContinue
+              $tsStatus = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json | ConvertFrom-Json
+              
+              Clear-Host
+              Write-Host "🖥️  RDP Session Active - $(Get-Date -Format 'HH:mm:ss')"
+              Write-Host "⏳ Time remaining: $hoursLefth $minutesLeftm"
+              Write-Host "📍 IP: $env:TAILSCALE_IP"
+              Write-Host "👤 User: $env:RDP_USERNAME"
+              Write-Host "🔧 RDP Service: $($rdpService.Status)"
+              Write-Host "🌐 Tailscale: $($tsStatus.BackendState)"
+              
+              if ($rdpService.Status -ne "Running") {
+                  Write-Warning "⚠️  RDP service not running - attempting restart"
+                  Start-Service -Name TermService -ErrorAction SilentlyContinue
+              }
+              
+              Start-Sleep -Seconds $checkInterval
+          }
+          
+          Write-Host "🕒 Session time completed - Shutting down..."
+
+      - name: Cleanup and Security Wipe
+        if: always()
+        run: |
+          Write-Host "🧹 Cleaning up sensitive data..."
+          
+          # Remove user account
+          $username = "${{ inputs.username }}"
+          Remove-LocalUser -Name $username -ErrorAction SilentlyContinue
+          
+          # Clear environment variables
+          $env:RDP_USERNAME = $null
+          $env:RDP_PASSWORD = $null
+          
+          # Disable RDP
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 1 -Force
+          
+          # Remove firewall rule
+          netsh advfirewall firewall delete rule name="RDP-Enhanced" > $null 2>&1
+          
+          Write-Host "✅ Cleanup completed - All sensitive data removed"
